@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GethAccountPrestate {
     pub balance: U256,
-    pub nonce: U256,
+    pub nonce: u64,
     pub code: Bytes,
     pub storage: BTreeMap<H256, H256>,
 }
@@ -60,6 +60,8 @@ pub enum GethDebugTracerType {
     /// callTracer (native)
     #[serde(rename = "callTracer")]
     CallTracer,
+    #[serde(rename = "prestateTracer")]
+    PrestateTracer,
 }
 
 /// Bindings for additional `debug_traceTransaction` options
