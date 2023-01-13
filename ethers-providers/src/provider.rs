@@ -4,7 +4,7 @@ use crate::{
     pubsub::{PubsubClient, SubscriptionStream},
     stream::{FilterWatcher, DEFAULT_LOCAL_POLL_INTERVAL, DEFAULT_POLL_INTERVAL},
     FromErr, Http as HttpProvider, JsonRpcClient, JsonRpcClientWrapper, LogQuery, MockProvider,
-    PendingTransaction, QuorumProvider, RwClient, SyncingStatus,
+    NodeInfo, PeerInfo, PendingTransaction, QuorumProvider, RwClient, SyncingStatus,
 };
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "ws"))]
@@ -21,25 +21,24 @@ use ethers_core::{
     abi::{self, Detokenize, ParamType},
     types::{
         transaction::{eip2718::TypedTransaction, eip2930::AccessListWithGasUsed},
-        Address, Block, BlockId, BlockNumber, BlockTrace, Bytes, EIP1186ProofResponse, FeeHistory,
-        Filter, FilterBlockOption, GethDebugTracingOptions, GethTrace, Log, NameOrAddress,
-        Selector, Signature, Trace, TraceFilter, TraceType, Transaction, TransactionReceipt,
-        TransactionRequest, TxHash, TxpoolContent, TxpoolInspect, TxpoolStatus, H256, U256, U64, GethTransactionPrestateTrace
+        Address, Block, BlockId, BlockNumber, BlockTrace, Bytes, Chain, EIP1186ProofResponse,
+        FeeHistory, Filter, FilterBlockOption, GethDebugTracingCallOptions,
+        GethDebugTracingOptions, GethTrace, Log, NameOrAddress, Selector, Signature, Trace,
+        TraceFilter, TraceType, Transaction, TransactionReceipt, TransactionRequest, TxHash,
+        TxpoolContent, TxpoolInspect, TxpoolStatus, H256, U256, U64, GethTransactionPrestateTrace,
     },
     utils,
 };
+use futures_util::{lock::Mutex, try_join};
 use hex::FromHex;
 use serde::{de::DeserializeOwned, Serialize};
-use thiserror::Error;
-use url::{ParseError, Url};
-
-use ethers_core::types::Chain;
-use futures_util::{lock::Mutex, try_join};
 use std::{
     collections::VecDeque, convert::TryFrom, fmt::Debug, str::FromStr, sync::Arc, time::Duration,
 };
+use thiserror::Error;
 use tracing::trace;
 use tracing_futures::Instrument;
+use url::{ParseError, Url};
 
 #[derive(Copy, Clone)]
 pub enum NodeClient {
@@ -304,6 +303,11 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
         self
     }
 
+    fn convert_err(p: ProviderError) -> Self::Error {
+        // no conversion necessary
+        p
+    }
+
     fn default_sender(&self) -> Option<Address> {
         self.from
     }
@@ -346,8 +350,19 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
                 if inner.max_fee_per_gas.is_none() || inner.max_priority_fee_per_gas.is_none() {
                     let (max_fee_per_gas, max_priority_fee_per_gas) =
                         self.estimate_eip1559_fees(None).await?;
-                    inner.max_fee_per_gas = Some(max_fee_per_gas);
-                    inner.max_priority_fee_per_gas = Some(max_priority_fee_per_gas);
+                    // we want to avoid overriding the user if either of these
+                    // are set. In order to do this, we refuse to override the
+                    // `max_fee_per_gas` if already set.
+                    // However, we must preserve the constraint that the tip
+                    // cannot be higher than max fee, so we override user
+                    // intent if that is so. We override by
+                    //   - first: if set, set to the min(current value, MFPG)
+                    //   - second, if still unset, use the RPC estimated amount
+                    let mfpg = inner.max_fee_per_gas.get_or_insert(max_fee_per_gas);
+                    inner.max_priority_fee_per_gas = inner
+                        .max_priority_fee_per_gas
+                        .map(|tip| std::cmp::min(tip, *mfpg))
+                        .or(Some(max_priority_fee_per_gas));
                 };
             }
         }
@@ -798,6 +813,110 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
         self.request("eth_getProof", [from, locations, block]).await
     }
 
+    /// Returns an indication if this node is currently mining.
+    async fn mining(&self) -> Result<bool, Self::Error> {
+        self.request("eth_mining", ()).await
+    }
+
+    // Personal namespace
+    // NOTE: This will eventually need to be enabled by users explicitly because the personal
+    // namespace is being deprecated:
+    // Issue: https://github.com/ethereum/go-ethereum/issues/25948
+    // PR: https://github.com/ethereum/go-ethereum/pull/26390
+
+    /// Sends the given key to the node to be encrypted with the provided passphrase and stored.
+    ///
+    /// The key represents a secp256k1 private key and should be 32 bytes.
+    async fn import_raw_key(
+        &self,
+        private_key: Bytes,
+        passphrase: String,
+    ) -> Result<Address, ProviderError> {
+        // private key should not be prefixed with 0x - it is also up to the user to pass in a key
+        // of the correct length
+
+        // the private key argument is supposed to be a string
+        let private_key_hex = hex::encode(private_key);
+        let private_key = utils::serialize(&private_key_hex);
+        let passphrase = utils::serialize(&passphrase);
+        self.request("personal_importRawKey", [private_key, passphrase]).await
+    }
+
+    /// Prompts the node to decrypt the given account from its keystore.
+    ///
+    /// If the duration provided is `None`, then the account will be unlocked indefinitely.
+    /// Otherwise, the account will be unlocked for the provided number of seconds.
+    async fn unlock_account<T: Into<Address> + Send + Sync>(
+        &self,
+        account: T,
+        passphrase: String,
+        duration: Option<u64>,
+    ) -> Result<bool, ProviderError> {
+        let account = utils::serialize(&account.into());
+        let duration = utils::serialize(&duration.unwrap_or(0));
+        let passphrase = utils::serialize(&passphrase);
+        self.request("personal_unlockAccount", [account, passphrase, duration]).await
+    }
+
+    // Admin namespace
+
+    /// Requests adding the given peer, returning a boolean representing whether or not the peer
+    /// was accepted for tracking.
+    async fn add_peer(&self, enode_url: String) -> Result<bool, Self::Error> {
+        let enode_url = utils::serialize(&enode_url);
+        self.request("admin_addPeer", [enode_url]).await
+    }
+
+    /// Requests adding the given peer as a trusted peer, which the node will always connect to
+    /// even when its peer slots are full.
+    async fn add_trusted_peer(&self, enode_url: String) -> Result<bool, Self::Error> {
+        let enode_url = utils::serialize(&enode_url);
+        self.request("admin_addTrustedPeer", [enode_url]).await
+    }
+
+    /// Returns general information about the node as well as information about the running p2p
+    /// protocols (e.g. `eth`, `snap`).
+    async fn node_info(&self) -> Result<NodeInfo, Self::Error> {
+        self.request("admin_nodeInfo", ()).await
+    }
+
+    /// Returns the list of peers currently connected to the node.
+    async fn peers(&self) -> Result<Vec<PeerInfo>, Self::Error> {
+        self.request("admin_peers", ()).await
+    }
+
+    /// Requests to remove the given peer, returning true if the enode was successfully parsed and
+    /// the peer was removed.
+    async fn remove_peer(&self, enode_url: String) -> Result<bool, Self::Error> {
+        let enode_url = utils::serialize(&enode_url);
+        self.request("admin_removePeer", [enode_url]).await
+    }
+
+    /// Requests to remove the given peer, returning a boolean representing whether or not the
+    /// enode url passed was validated. A return value of `true` does not necessarily mean that the
+    /// peer was disconnected.
+    async fn remove_trusted_peer(&self, enode_url: String) -> Result<bool, Self::Error> {
+        let enode_url = utils::serialize(&enode_url);
+        self.request("admin_removeTrustedPeer", [enode_url]).await
+    }
+
+    // Miner namespace
+
+    /// Starts the miner with the given number of threads. If threads is nil, the number of workers
+    /// started is equal to the number of logical CPUs that are usable by this process. If mining
+    /// is already running, this method adjust the number of threads allowed to use and updates the
+    /// minimum price required by the transaction pool.
+    async fn start_mining(&self, threads: Option<usize>) -> Result<(), Self::Error> {
+        let threads = utils::serialize(&threads);
+        self.request("miner_start", [threads]).await
+    }
+
+    /// Stop terminates the miner, both at the consensus engine level as well as at the block
+    /// creation level.
+    async fn stop_mining(&self) -> Result<(), Self::Error> {
+        self.request("miner_stop", ()).await
+    }
+
     ////// Ethereum Naming Service
     // The Ethereum Naming Service (ENS) allows easy to remember and use names to
     // be assigned to Ethereum addresses. Any provider operation which takes an address
@@ -1017,6 +1136,20 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
                 self.request("debug_traceBlockByNumber", [num, trace_options]).await?
             }
         })
+    }
+
+    /// Executes the given call and returns a number of possible traces for it
+    async fn debug_trace_call<T: Into<TypedTransaction> + Send + Sync>(
+        &self,
+        req: T,
+        block: Option<BlockId>,
+        trace_options: GethDebugTracingCallOptions,
+    ) -> Result<GethTrace, ProviderError> {
+        let req = req.into();
+        let req = utils::serialize(&req);
+        let block = utils::serialize(&block.unwrap_or_else(|| BlockNumber::Latest.into()));
+        let trace_options = utils::serialize(&trace_options);
+        self.request("debug_traceCall", [req, block, trace_options]).await
     }
 
     /// Executes the given call and returns a number of possible traces for it
@@ -1274,8 +1407,7 @@ impl<P: JsonRpcClient> Provider<P> {
 
         if data.is_empty() {
             return Err(ProviderError::EnsError(format!(
-                "`{}` resolver ({:?}) is invalid.",
-                ens_name, resolver_address
+                "`{ens_name}` resolver ({resolver_address:?}) is invalid."
             )))
         }
 
@@ -1361,9 +1493,14 @@ impl Provider<crate::Ws> {
     }
 }
 
-#[cfg(all(target_family = "unix", feature = "ipc"))]
+#[cfg(all(feature = "ipc", any(unix, windows)))]
 impl Provider<crate::Ipc> {
-    /// Direct connection to an IPC socket.
+    #[cfg_attr(unix, doc = "Connects to the Unix socket at the provided path.")]
+    #[cfg_attr(windows, doc = "Connects to the named pipe at the provided path.\n")]
+    #[cfg_attr(
+        windows,
+        doc = r"Note: the path must be the fully qualified, like: `\\.\pipe\<name>`."
+    )]
     pub async fn connect_ipc(path: impl AsRef<std::path::Path>) -> Result<Self, ProviderError> {
         let ipc = crate::Ipc::connect(path).await?;
         Ok(Self::new(ipc))
@@ -1771,13 +1908,15 @@ pub mod dev_rpc {
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::Http;
     use ethers_core::{
         types::{
             transaction::eip2930::AccessList, Eip1559TransactionRequest, TransactionRequest, H256,
         },
-        utils::Anvil,
+        utils::{Anvil, Genesis, Geth, GethInstance},
     };
     use futures_util::StreamExt;
 
@@ -2141,5 +2280,152 @@ mod tests {
             &err.to_string(),
             "ens name not found: `ox63616e.eth` resolver (0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2) is invalid."
         );
+    }
+
+    #[tokio::test]
+    async fn geth_admin_nodeinfo() {
+        // we can't use the test provider because infura does not expose admin endpoints
+        let port = 8546u16;
+        let p2p_listener_port = 13337u16;
+        let authrpc_port = 8552u16;
+        let network = 1337u64;
+        let temp_dir = tempfile::tempdir().unwrap().into_path();
+
+        let (geth, provider) = spawn_geth_and_create_provider(
+            network,
+            port,
+            p2p_listener_port,
+            authrpc_port,
+            Some(temp_dir),
+            None,
+        );
+
+        let info = provider.node_info().await.unwrap();
+        drop(geth);
+
+        // check that the port we set works
+        assert_eq!(info.ports.listener, p2p_listener_port);
+
+        // make sure it is running eth
+        assert!(info.protocols.eth.is_some());
+
+        // check that the network id is correct
+        assert_eq!(info.protocols.eth.unwrap().network, network);
+    }
+
+    /// Spawn a new `GethInstance` without discovery and crate a `Provider` for it.
+    ///
+    /// These will all use the same genesis config.
+    fn spawn_geth_and_create_provider(
+        chain_id: u64,
+        rpc_port: u16,
+        p2p_port: u16,
+        authrpc_port: u16,
+        datadir: Option<PathBuf>,
+        genesis: Option<Genesis>,
+    ) -> (GethInstance, Provider<HttpProvider>) {
+        let geth = Geth::new()
+            .port(rpc_port)
+            .p2p_port(p2p_port)
+            .authrpc_port(authrpc_port)
+            .chain_id(chain_id)
+            .disable_discovery();
+
+        let geth = match genesis {
+            Some(genesis) => geth.genesis(genesis),
+            None => geth,
+        };
+
+        let geth = match datadir {
+            Some(dir) => geth.data_dir(dir),
+            None => geth,
+        }
+        .spawn();
+
+        let url = format!("http://127.0.0.1:{rpc_port}");
+        let provider = Provider::try_from(url).unwrap();
+        (geth, provider)
+    }
+
+    /// Spawn a set of [`GethInstance`]s with the list of given data directories and [`Provider`]s
+    /// for those [`GethInstance`]s without discovery, setting sequential ports for their p2p, rpc,
+    /// and authrpc ports.
+    fn spawn_geth_instances(
+        datadirs: Vec<PathBuf>,
+        chain_id: u64,
+        genesis: Option<Genesis>,
+    ) -> Vec<(GethInstance, Provider<HttpProvider>)> {
+        let mut geths = Vec::new();
+        let mut p2p_port = 30303;
+        let mut rpc_port = 8545;
+        let mut authrpc_port = 8551;
+
+        for dir in datadirs {
+            let (geth, provider) = spawn_geth_and_create_provider(
+                chain_id,
+                rpc_port,
+                p2p_port,
+                authrpc_port,
+                Some(dir),
+                genesis.clone(),
+            );
+
+            geths.push((geth, provider));
+
+            p2p_port += 1;
+            rpc_port += 1;
+            authrpc_port += 1;
+        }
+
+        geths
+    }
+
+    #[tokio::test]
+    async fn add_second_geth_peer() {
+        // init each geth directory
+        let dir1 = tempfile::tempdir().unwrap().into_path();
+        let dir2 = tempfile::tempdir().unwrap().into_path();
+
+        // use the default genesis
+        let genesis = utils::Genesis::default();
+
+        // spawn the geths
+        let mut geths = spawn_geth_instances(vec![dir1.clone(), dir2.clone()], 1337, Some(genesis));
+        let (mut first_geth, first_peer) = geths.pop().unwrap();
+        let (second_geth, second_peer) = geths.pop().unwrap();
+
+        // get nodeinfo for each geth instance
+        let first_info = first_peer.node_info().await.unwrap();
+        let second_info = second_peer.node_info().await.unwrap();
+        let first_port = first_info.ports.listener;
+
+        // replace the ip in the enode by putting
+        let first_prefix = first_info.enode.split('@').collect::<Vec<&str>>();
+
+        // create enodes for each geth instance using each id and port
+        let first_enode = format!("{}@localhost:{}", first_prefix.first().unwrap(), first_port);
+
+        // add the first geth as a peer for the second
+        let res = second_peer.add_peer(first_enode).await.unwrap();
+        assert!(res);
+
+        // wait on the listening peer for an incoming connection
+        first_geth.wait_to_add_peer(second_info.id).unwrap();
+
+        // check that second_geth exists in the first_geth peer list
+        let peers = first_peer.peers().await.unwrap();
+
+        drop(first_geth);
+        drop(second_geth);
+
+        // check that the second peer is in the list (it uses an enr so the enr should be Some)
+        assert_eq!(peers.len(), 1);
+
+        let peer = peers.get(0).unwrap();
+        assert_eq!(H256::from_str(&peer.id).unwrap(), second_info.id);
+
+        // remove directories
+        std::fs::remove_dir_all(dir1).unwrap();
+        std::fs::remove_dir_all(dir2).unwrap();
     }
 }

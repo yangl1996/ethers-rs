@@ -125,10 +125,10 @@ impl Context {
         let function_name = &function.name;
         let abi_signature = function.abi_signature();
         let doc = format!(
-            "Container type for all input parameters for the `{}` function with signature `{}` and selector `{:?}`",
+            "Container type for all input parameters for the `{}` function with signature `{}` and selector `0x{}`",
             function.name,
             abi_signature,
-            function.selector()
+            hex::encode(&function.selector()[..])
         );
         let abi_signature_doc = util::expand_doc(&doc);
         let ethers_contract = ethers_contract_crate();
@@ -177,10 +177,10 @@ impl Context {
         };
         let abi_signature = function.abi_signature();
         let doc = format!(
-            "Container type for all return fields from the `{}` function with signature `{}` and selector `{:?}`",
+            "Container type for all return fields from the `{}` function with signature `{}` and selector `0x{}`",
             function.name,
             abi_signature,
-            function.selector()
+            hex::encode(&function.selector()[..])
         );
         let abi_signature_doc = util::expand_doc(&doc);
         let ethers_contract = ethers_contract_crate();
@@ -846,31 +846,28 @@ mod tests {
     }
 
     #[test]
-    fn expand_inputs_() {
+    fn test_expand_inputs() {
         assert_quote!(
-            expand_inputs(
-
-                &[
-                    Param {
-                        name: "a".to_string(),
-                        kind: ParamType::Bool,
-                        internal_type: None,
-                    },
-                    Param {
-                        name: "b".to_string(),
-                        kind: ParamType::Address,
-                        internal_type: None,
-                    },
-                ],
-            )
+            expand_inputs(&[
+                Param {
+                    name: "a".to_string(),
+                    kind: ParamType::Bool,
+                    internal_type: None,
+                },
+                Param {
+                    name: "b".to_string(),
+                    kind: ParamType::Address,
+                    internal_type: None,
+                },
+            ])
             .unwrap(),
-            { , a: bool, b: ethers_core::types::Address },
+            { , a: bool, b: ::ethers_core::types::Address },
         );
     }
 
     #[test]
     fn expand_fn_outputs_empty() {
-        assert_quote!(expand_fn_outputs(&[],).unwrap(), { () });
+        assert_quote!(expand_fn_outputs(&[]).unwrap(), { () });
     }
 
     #[test]
@@ -892,9 +889,9 @@ mod tests {
             expand_fn_outputs(&[
                 Param { name: "a".to_string(), kind: ParamType::Bool, internal_type: None },
                 Param { name: "b".to_string(), kind: ParamType::Address, internal_type: None },
-            ],)
+            ])
             .unwrap(),
-            { (bool, ethers_core::types::Address) },
+            { (bool, ::ethers_core::types::Address) },
         );
     }
 }

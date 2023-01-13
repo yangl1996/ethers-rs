@@ -15,7 +15,7 @@ mod eth_tests {
     use ethers_derive_eip712::*;
     use ethers_providers::{Http, Middleware, PendingTransaction, Provider, StreamExt};
     use ethers_signers::{LocalWallet, Signer};
-    use std::{convert::TryFrom, sync::Arc, time::Duration};
+    use std::{convert::TryFrom, iter::FromIterator, sync::Arc, time::Duration};
 
     #[tokio::test]
     async fn deploy_and_call_contract() {
@@ -491,8 +491,7 @@ mod eth_tests {
         multicall_send.clear_calls().add_call(broadcast, false).add_call(broadcast2, false);
 
         // broadcast the transaction and wait for it to be mined
-        let tx_hash = multicall_send.legacy().send().await.unwrap();
-        let _tx_receipt = PendingTransaction::new(tx_hash, client.provider()).await.unwrap();
+        let _tx_receipt = multicall_send.legacy().send().await.unwrap().await.unwrap();
 
         // Do another multicall to check the updated return values
         // The `getValue` calls should return the last value we set in the batched broadcast
@@ -517,10 +516,26 @@ mod eth_tests {
             .add_get_eth_balance(addrs[5], false)
             .add_get_eth_balance(addrs[6], false);
 
+        let valid_balances = [
+            U256::from(10_000_000_000_000_000_000_000u128),
+            U256::from(10_000_000_000_000_000_000_000u128),
+            U256::from(10_000_000_000_000_000_000_000u128),
+        ];
+
         let balances: (U256, U256, U256) = multicall.call().await.unwrap();
-        assert_eq!(balances.0, U256::from(10_000_000_000_000_000_000_000u128));
-        assert_eq!(balances.1, U256::from(10_000_000_000_000_000_000_000u128));
-        assert_eq!(balances.2, U256::from(10_000_000_000_000_000_000_000u128));
+        assert_eq!(balances.0, valid_balances[0]);
+        assert_eq!(balances.1, valid_balances[1]);
+        assert_eq!(balances.2, valid_balances[2]);
+
+        // call_array
+        multicall
+            .clear_calls()
+            .add_get_eth_balance(addrs[4], false)
+            .add_get_eth_balance(addrs[5], false)
+            .add_get_eth_balance(addrs[6], false);
+
+        let balances: Vec<U256> = multicall.call_array().await.unwrap();
+        assert_eq!(balances, Vec::from_iter(valid_balances.iter().copied()));
 
         // clear multicall so we can test `call_raw` w/ >16 calls
         multicall.clear_calls();
@@ -536,10 +551,11 @@ mod eth_tests {
             .unwrap();
 
         // build up a list of calls greater than the 16 max restriction
-        for i in 0..=16 {
-            let call = simple_contract.method::<_, String>("getValue", ()).unwrap();
-            multicall.add_call(call, false);
-        }
+        multicall.add_calls(
+            false,
+            std::iter::repeat(simple_contract.method::<_, String>("getValue", ()).unwrap())
+                .take(17), // .collect(),
+        );
 
         // must use `call_raw` as `.calls` > 16
         let tokens = multicall.call_raw().await.unwrap();
@@ -694,22 +710,22 @@ mod eth_tests {
             .clear_calls()
             .add_call(empty_revert.clone(), true)
             .add_call(empty_revert.clone(), true);
-        let res: ((bool, String), (bool, String)) = multicall.call().await.unwrap();
+        let res: ((bool, Bytes), (bool, Bytes)) = multicall.call().await.unwrap();
         assert!(!res.0 .0);
-        assert_eq!(res.0 .1, "");
+        assert_eq!(res.0 .1, Bytes::default());
 
         // string revert
         let string_revert =
             reverting_contract.method::<_, H256>("stringRevert", ("String".to_string())).unwrap();
         multicall.clear_calls().add_call(string_revert, true).add_call(empty_revert.clone(), true);
-        let res: ((bool, String), (bool, String)) = multicall.call().await.unwrap();
+        let res: ((bool, String), (bool, Bytes)) = multicall.call().await.unwrap();
         assert!(!res.0 .0);
         assert_eq!(res.0 .1, "String");
 
         // custom error revert
         let custom_error = reverting_contract.method::<_, H256>("customError", ()).unwrap();
         multicall.clear_calls().add_call(custom_error, true).add_call(empty_revert.clone(), true);
-        let res: ((bool, Bytes), (bool, String)) = multicall.call().await.unwrap();
+        let res: ((bool, Bytes), (bool, Bytes)) = multicall.call().await.unwrap();
         let selector = &keccak256("CustomError()")[..4];
         assert!(!res.0 .0);
         assert_eq!(res.0 .1.len(), 4);
@@ -723,7 +739,7 @@ mod eth_tests {
             .clear_calls()
             .add_call(custom_error_with_data, true)
             .add_call(empty_revert.clone(), true);
-        let res: ((bool, Bytes), (bool, String)) = multicall.call().await.unwrap();
+        let res: ((bool, Bytes), (bool, Bytes)) = multicall.call().await.unwrap();
         let selector = &keccak256("CustomErrorWithData(string)")[..4];
         assert!(!res.0 .0);
         assert_eq!(&res.0 .1[..4], selector);

@@ -22,7 +22,10 @@ pub mod contract;
 pub mod output_selection;
 pub mod serde_helpers;
 use crate::{
-    artifacts::output_selection::{ContractOutputSelection, OutputSelection},
+    artifacts::{
+        lowfidelity::NodeType,
+        output_selection::{ContractOutputSelection, OutputSelection},
+    },
     filter::FilteredSources,
 };
 pub use bytecode::*;
@@ -532,8 +535,7 @@ impl Libraries {
                 .ok_or_else(|| SolcError::msg(format!("failed to parse library address: {lib}")))?;
             if items.next().is_some() {
                 return Err(SolcError::msg(format!(
-                    "failed to parse, too many arguments passed: {}",
-                    lib
+                    "failed to parse, too many arguments passed: {lib}"
                 )))
             }
             libraries

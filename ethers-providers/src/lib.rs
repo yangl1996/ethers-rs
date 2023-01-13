@@ -3,12 +3,16 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 #![allow(clippy::type_complexity)]
 #![doc = include_str!("../README.md")]
+
 mod transports;
-use futures_util::future::join_all;
 pub use transports::*;
 
 mod provider;
 pub use provider::{is_local_endpoint, FilterKind, Provider, ProviderError, ProviderExt};
+
+// types for the admin api
+pub mod admin;
+pub use admin::{NodeInfo, PeerInfo};
 
 // ENS support
 pub mod ens;
@@ -36,7 +40,11 @@ pub mod erc;
 
 use async_trait::async_trait;
 use auto_impl::auto_impl;
-use ethers_core::types::transaction::{eip2718::TypedTransaction, eip2930::AccessListWithGasUsed};
+use ethers_core::types::{
+    transaction::{eip2718::TypedTransaction, eip2930::AccessListWithGasUsed},
+    *,
+};
+use futures_util::future::join_all;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{error::Error, fmt::Debug, future::Future, pin::Pin};
 use url::Url;
@@ -71,7 +79,6 @@ pub trait JsonRpcClient: Debug + Send + Sync {
         R: DeserializeOwned;
 }
 
-use ethers_core::types::*;
 pub trait FromErr<T> {
     fn from(src: T) -> Self;
 }
@@ -154,6 +161,13 @@ pub trait Middleware: Sync + Send + Debug {
 
     /// The next middleware in the stack
     fn inner(&self) -> &Self::Inner;
+
+    /// Convert a provider error into the associated error type by successively
+    /// converting it to every intermediate middleware error
+    fn convert_err(p: ProviderError) -> Self::Error {
+        let e = <Self as Middleware>::Inner::convert_err(p);
+        FromErr::from(e)
+    }
 
     /// The HTTP or Websocket provider.
     fn provider(&self) -> &Provider<Self::Provider> {
@@ -488,6 +502,72 @@ pub trait Middleware: Sync + Send + Debug {
         self.inner().get_proof(from, locations, block).await.map_err(FromErr::from)
     }
 
+    /// Returns an indication if this node is currently mining.
+    async fn mining(&self) -> Result<bool, Self::Error> {
+        self.inner().mining().await.map_err(FromErr::from)
+    }
+
+    // Personal namespace
+
+    async fn import_raw_key(
+        &self,
+        private_key: Bytes,
+        passphrase: String,
+    ) -> Result<Address, ProviderError> {
+        self.inner().import_raw_key(private_key, passphrase).await.map_err(FromErr::from)
+    }
+
+    async fn unlock_account<T: Into<Address> + Send + Sync>(
+        &self,
+        account: T,
+        passphrase: String,
+        duration: Option<u64>,
+    ) -> Result<bool, ProviderError> {
+        self.inner().unlock_account(account, passphrase, duration).await.map_err(FromErr::from)
+    }
+
+    // Admin namespace
+
+    async fn add_peer(&self, enode_url: String) -> Result<bool, Self::Error> {
+        self.inner().add_peer(enode_url).await.map_err(FromErr::from)
+    }
+
+    async fn add_trusted_peer(&self, enode_url: String) -> Result<bool, Self::Error> {
+        self.inner().add_trusted_peer(enode_url).await.map_err(FromErr::from)
+    }
+
+    async fn node_info(&self) -> Result<NodeInfo, Self::Error> {
+        self.inner().node_info().await.map_err(FromErr::from)
+    }
+
+    async fn peers(&self) -> Result<Vec<PeerInfo>, Self::Error> {
+        self.inner().peers().await.map_err(FromErr::from)
+    }
+
+    async fn remove_peer(&self, enode_url: String) -> Result<bool, Self::Error> {
+        self.inner().remove_peer(enode_url).await.map_err(FromErr::from)
+    }
+
+    async fn remove_trusted_peer(&self, enode_url: String) -> Result<bool, Self::Error> {
+        self.inner().remove_trusted_peer(enode_url).await.map_err(FromErr::from)
+    }
+
+    // Miner namespace
+
+    /// Starts the miner with the given number of threads. If threads is nil, the number of workers
+    /// started is equal to the number of logical CPUs that are usable by this process. If mining
+    /// is already running, this method adjust the number of threads allowed to use and updates the
+    /// minimum price required by the transaction pool.
+    async fn start_mining(&self, threads: Option<usize>) -> Result<(), Self::Error> {
+        self.inner().start_mining(threads).await.map_err(FromErr::from)
+    }
+
+    /// Stop terminates the miner, both at the consensus engine level as well as at
+    /// the block creation level.
+    async fn stop_mining(&self) -> Result<(), Self::Error> {
+        self.inner().stop_mining().await.map_err(FromErr::from)
+    }
+
     // Mempool inspection for Geth's API
 
     async fn txpool_content(&self) -> Result<TxpoolContent, Self::Error> {
@@ -503,6 +583,7 @@ pub trait Middleware: Sync + Send + Debug {
     }
 
     // Geth `trace` support
+
     /// After replaying any previous transactions in the same block,
     /// Replays a transaction, returning the traces configured with passed options
     async fn debug_trace_transaction(
@@ -519,6 +600,16 @@ pub trait Middleware: Sync + Send + Debug {
         trace_options: GethDebugTracingOptions,
     ) -> Result<Vec<GethTransactionPrestateTrace>, Self::Error> {
         self.inner().debug_trace_block(block_hash_or_number, trace_options).await.map_err(FromErr::from)
+    }
+
+    /// Executes the given call and returns a number of possible traces for it
+    async fn debug_trace_call<T: Into<TypedTransaction> + Send + Sync>(
+        &self,
+        req: T,
+        block: Option<BlockId>,
+        trace_options: GethDebugTracingCallOptions,
+    ) -> Result<GethTrace, ProviderError> {
+        self.inner().debug_trace_call(req, block, trace_options).await.map_err(FromErr::from)
     }
 
     // Parity `trace` support
@@ -683,7 +774,8 @@ pub trait CeloMiddleware: Middleware {
     }
 }
 
-pub use test_provider::{GOERLI, MAINNET, ROPSTEN};
+#[allow(deprecated)]
+pub use test_provider::{GOERLI, MAINNET, ROPSTEN, SEPOLIA};
 
 /// Pre-instantiated Infura HTTP clients which rotate through multiple API keys
 /// to prevent rate limits
@@ -703,9 +795,13 @@ pub mod test_provider {
         "5c812e02193c4ba793f8c214317582bd",
     ];
 
-    pub static GOERLI: Lazy<TestProvider> = Lazy::new(|| TestProvider::new(INFURA_KEYS, "goerli"));
     pub static MAINNET: Lazy<TestProvider> =
         Lazy::new(|| TestProvider::new(INFURA_KEYS, "mainnet"));
+    pub static GOERLI: Lazy<TestProvider> = Lazy::new(|| TestProvider::new(INFURA_KEYS, "goerli"));
+    pub static SEPOLIA: Lazy<TestProvider> =
+        Lazy::new(|| TestProvider::new(INFURA_KEYS, "sepolia"));
+
+    #[deprecated = "Ropsten testnet has been deprecated in favor of Goerli or Sepolia."]
     pub static ROPSTEN: Lazy<TestProvider> =
         Lazy::new(|| TestProvider::new(INFURA_KEYS, "ropsten"));
 
@@ -716,16 +812,14 @@ pub mod test_provider {
     }
 
     impl TestProvider {
-        pub fn new(keys: &'static [&'static str], network: &str) -> Self {
-            Self { keys: Mutex::new(keys.iter().cycle()), network: network.to_owned() }
+        pub fn new(keys: &'static [&'static str], network: impl Into<String>) -> Self {
+            Self { keys: keys.iter().cycle().into(), network: network.into() }
         }
 
         pub fn url(&self) -> String {
-            format!(
-                "https://{}.infura.io/v3/{}",
-                self.network,
-                self.keys.lock().unwrap().next().unwrap()
-            )
+            let Self { network, keys } = self;
+            let key = keys.lock().unwrap().next().unwrap();
+            format!("https://{network}.infura.io/v3/{key}")
         }
 
         pub fn provider(&self) -> Provider<Http> {

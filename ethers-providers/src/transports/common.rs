@@ -1,17 +1,17 @@
 // Code adapted from: https://github.com/althea-net/guac_rs/tree/master/web3/src/jsonrpc
-use std::fmt;
 
+use base64::{engine::general_purpose, Engine};
+use ethers_core::types::U256;
 use serde::{
     de::{self, MapAccess, Unexpected, Visitor},
     Deserialize, Serialize,
 };
 use serde_json::{value::RawValue, Value};
+use std::fmt;
 use thiserror::Error;
 
-use ethers_core::types::U256;
-
-#[derive(Deserialize, Debug, Clone, Error)]
 /// A JSON-RPC 2.0 error
+#[derive(Deserialize, Debug, Clone, Error)]
 pub struct JsonRpcError {
     /// The error code
     pub code: i64,
@@ -191,8 +191,10 @@ pub enum Authorization {
 }
 
 impl Authorization {
-    pub fn basic(username: impl Into<String>, password: impl Into<String>) -> Self {
-        let auth_secret = base64::encode(username.into() + ":" + &password.into());
+    pub fn basic(username: impl AsRef<str>, password: impl AsRef<str>) -> Self {
+        let username = username.as_ref();
+        let password = password.as_ref();
+        let auth_secret = general_purpose::STANDARD.encode(format!("{username}:{password}"));
         Self::Basic(auth_secret)
     }
 

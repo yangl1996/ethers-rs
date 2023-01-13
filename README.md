@@ -15,7 +15,12 @@ Extensive documentation and examples are available [here](https://docs.rs/ethers
 
 Alternatively, you may clone the repository and run `cd ethers/ && cargo doc --open`
 
-You can also run any of the examples by executing: `cargo run -p ethers --example <name>`
+Examples are organized into individual crates under the `/examples` folder.
+You can run any of the examples by executing: 
+```bash
+# cargo run -p <example-crate-name> --example <name>
+cargo run -p examples-big-numbers --example math_operations
+```
 
 ## Add ethers-rs to your repository
 
@@ -36,7 +41,7 @@ Tests require the following installed:
 3. [`geth`](https://github.com/ethereum/go-ethereum)
 
 In addition, it is recommended that you set the `ETHERSCAN_API_KEY` environment variable
-for [the abigen via Etherscan](https://github.com/gakonst/ethers-rs/blob/master/ethers-contract/tests/abigen.rs) tests.
+for [the abigen via Etherscan](https://github.com/gakonst/ethers-rs/blob/master/ethers-contract/tests/it/abigen.rs) tests.
 You can get one [here](https://etherscan.io/apis).
 
 ### EVM-compatible chains support

@@ -1,8 +1,8 @@
 [package]
 name = "ethers-providers"
 version = "1.0.2"
-edition = "2018"
-rust-version = "1.62"
+edition = "2021"
+rust-version = "1.64"
 authors = ["Georgios Konstantopoulos <me@gakonst.com>"]
 license = "MIT OR Apache-2.0"
 description = "Provider implementations for the ethers-rs crate"
@@ -26,7 +26,7 @@ thiserror = { version = "1.0", default-features = false }
 url = { version = "2.3.1", default-features = false }
 auto_impl = { version = "1.0.1", default-features = false }
 http = { version = "0.2" }
-base64 = "0.13"
+base64 = "0.21"
 
 # required for implementing stream on the filters
 futures-core = { version = "0.3.16", default-features = false }
@@ -35,18 +35,24 @@ futures-timer = { version = "3.0.2", default-features = false }
 futures-channel = { version = "0.3.16", default-features = false, optional = true }
 pin-project = { version = "1.0.11", default-features = false }
 
+# peer-related admin namespace
+enr = { version = "0.7.0", default-features = false, features = ["k256", "serde"] }
+
 # tracing
 tracing = { version = "0.1.37", default-features = false }
 tracing-futures = { version = "0.2.5", default-features = false, features = ["std-future"] }
 
 bytes = { version = "1.3.0", default-features = false, optional = true }
-once_cell = "1.16.0"
+once_cell = "1.17.0"
 hashers = "1.0.1"
+
+[target.'cfg(target_family = "windows")'.dependencies]
+winapi = { version = "0.3", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # tokio
-tokio = { version = "1.18", features = ["time"] }
-tokio-tungstenite = { version = "0.17.2", default-features = false, features = [
+tokio = { version = "1.18", default-features = false, features = ["time"] }
+tokio-tungstenite = { version = "0.18.0", default-features = false, features = [
     "connect",
 ], optional = true }
 
@@ -68,8 +74,9 @@ tempfile = "3.3.0"
 [features]
 default = ["ws", "rustls"]
 celo = ["ethers-core/celo"]
+
 ws = ["tokio-tungstenite", "futures-channel"]
-ipc = ["tokio/io-util", "bytes", "futures-channel"]
+ipc = ["tokio/io-util", "bytes", "futures-channel", "winapi"]
 
 openssl = ["tokio-tungstenite/native-tls", "reqwest/native-tls"]
 # we use the webpki roots so we can build static binaries w/o any root cert dependencies

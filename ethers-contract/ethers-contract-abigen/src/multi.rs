@@ -8,9 +8,12 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
 };
 use toml::Value;
+
+/// The default ethers dependency to generate.
+const DEFAULT_ETHERS_DEP: &str = "ethers = { git = \"https://github.com/gakonst/ethers-rs\", default-features = false, features = [\"abigen\"] }";
 
 /// Collects Abigen structs for a series of contracts, pending generation of
 /// the contract bindings.
@@ -25,6 +28,12 @@ impl std::ops::Deref for MultiAbigen {
 
     fn deref(&self) -> &Self::Target {
         &self.abigens
+    }
+}
+
+impl std::ops::DerefMut for MultiAbigen {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.abigens
     }
 }
 
@@ -130,11 +139,8 @@ impl MultiAbigen {
 
     /// Build the contract bindings and prepare for writing
     pub fn build(self) -> Result<MultiBindings> {
-        let rustfmt = self.abigens.iter().any(|gen| gen.rustfmt);
-        Ok(MultiBindings {
-            expansion: MultiExpansion::from_abigen(self.abigens)?.expand(),
-            rustfmt,
-        })
+        let format = self.abigens.iter().any(|gen| gen.format);
+        Ok(MultiBindings { expansion: MultiExpansion::from_abigen(self.abigens)?.expand(), format })
     }
 }
 
@@ -211,12 +217,17 @@ impl MultiExpansion {
             }
         }
 
-        MultiExpansionResult { contracts: expansions, dirty_contracts, shared_types }
+        MultiExpansionResult { root: None, contracts: expansions, dirty_contracts, shared_types }
     }
 }
 
 /// Represents an intermediary result of [`MultiExpansion::expand()`]
 pub struct MultiExpansionResult {
+    /// The root dir at which this should be executed.
+    ///
+    /// This is used to check if there's an existing `Cargo.toml`, from which we can derive the
+    /// proper `ethers` dependencies.
+    root: Option<PathBuf>,
     contracts: Vec<(ExpandedContract, Context)>,
     /// contains the indices of contracts with structs that need to be updated
     dirty_contracts: HashSet<usize>,
@@ -251,6 +262,14 @@ impl MultiExpansionResult {
         tokens
     }
 
+    /// Sets the directory from which this type should expand from.
+    ///
+    /// This is used to try to find the proper `ethers` dependency if the `root` is an existing
+    /// workspace. By default, the cwd is assumed to be the `root`.
+    pub fn set_root(&mut self, root: impl Into<PathBuf>) {
+        self.root = Some(root.into());
+    }
+
     /// Sets the path to the shared types module according to the value of `single_file`
     ///
     /// If `single_file` then it's expected that types will be written to `shared_types.rs`
@@ -276,14 +295,14 @@ impl MultiExpansionResult {
     }
 
     /// Converts this result into [`MultiBindingsInner`]
-    fn into_bindings(mut self, single_file: bool, rustfmt: bool) -> MultiBindingsInner {
+    fn into_bindings(mut self, single_file: bool, format: bool) -> MultiBindingsInner {
         self.set_shared_import_path(single_file);
-        let Self { contracts, shared_types, .. } = self;
+        let Self { contracts, shared_types, root, .. } = self;
         let bindings = contracts
             .into_iter()
             .map(|(expanded, ctx)| ContractBindings {
                 tokens: expanded.into_tokens(),
-                rustfmt,
+                format,
                 name: ctx.contract_name().to_string(),
             })
             .map(|v| (v.name.clone(), v))
@@ -303,14 +322,14 @@ impl MultiExpansionResult {
             };
             Some(ContractBindings {
                 tokens: shared_types,
-                rustfmt,
+                format,
                 name: "shared_types".to_string(),
             })
         } else {
             None
         };
 
-        MultiBindingsInner { bindings, shared_types }
+        MultiBindingsInner { root, bindings, shared_types }
     }
 }
 
@@ -342,7 +361,7 @@ impl MultiExpansionResult {
 ///     changed)
 pub struct MultiBindings {
     expansion: MultiExpansionResult,
-    rustfmt: bool,
+    format: bool,
 }
 
 impl MultiBindings {
@@ -356,8 +375,25 @@ impl MultiBindings {
         self.expansion.contracts.is_empty()
     }
 
+    #[must_use]
+    #[deprecated = "Use format instead"]
+    #[doc(hidden)]
+    pub fn rustfmt(mut self, rustfmt: bool) -> Self {
+        self.format = rustfmt;
+        self
+    }
+
+    /// Specify whether to format the code or not. True by default.
+    ///
+    /// This will use [`prettyplease`], so the resulting formatted code **will not** be affected by
+    /// the local `rustfmt` version or config.
+    pub fn format(mut self, format: bool) -> Self {
+        self.format = format;
+        self
+    }
+
     fn into_inner(self, single_file: bool) -> MultiBindingsInner {
-        self.expansion.into_bindings(single_file, self.rustfmt)
+        self.expansion.into_bindings(single_file, self.format)
     }
 
     /// Generates all the bindings and writes them to the given module
@@ -532,6 +568,11 @@ impl MultiBindings {
 }
 
 struct MultiBindingsInner {
+    /// The root dir at which this should be executed.
+    ///
+    /// This is used to check if there's an existing `Cargo.toml`, from which we can derive the
+    /// proper `ethers` dependencies.
+    root: Option<PathBuf>,
     /// Abigen objects to be written
     bindings: BTreeMap<String, ContractBindings>,
     /// contains the content of the shared types if any
@@ -565,20 +606,28 @@ impl MultiBindingsInner {
         writeln!(toml, "# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html")?;
         writeln!(toml)?;
         writeln!(toml, "[dependencies]")?;
-        writeln!(toml, r#"{}"#, crate_version)?;
+        writeln!(toml, r#"{crate_version}"#)?;
         Ok(toml)
     }
 
-    /// parses the active Cargo.toml to get what version of ethers we are using
-    fn find_crate_version(&self) -> Result<String> {
-        let cargo_toml = std::env::current_dir()?.join("Cargo.toml");
+    /// Returns the ethers crate version to use.
+    ///
+    /// If we fail to detect a matching `ethers` dependency, this returns the [`DEFAULT_ETHERS_DEP`]
+    /// version.
+    fn crate_version(&self) -> String {
+        self.try_find_crate_version().unwrap_or_else(|_| DEFAULT_ETHERS_DEP.to_string())
+    }
 
-        let default_dep = || {
-            "ethers = {{ git = \"https://github.com/gakonst/ethers-rs\", default-features = false, features = [\"abigen\"] }}".to_string()
-        };
+    /// parses the active Cargo.toml to get what version of ethers we are using.
+    ///
+    /// Fails if the existing `Cargo.toml` does not contain a valid ethers dependency
+    fn try_find_crate_version(&self) -> Result<String> {
+        let cargo_toml =
+            if let Some(root) = self.root.clone() { root } else { std::env::current_dir()? }
+                .join("Cargo.toml");
 
         if !cargo_toml.exists() {
-            return Ok(default_dep())
+            return Ok(DEFAULT_ETHERS_DEP.to_string())
         }
 
         let data = fs::read_to_string(cargo_toml)?;
@@ -590,14 +639,13 @@ impl MultiBindingsInner {
             .ok_or_else(|| eyre::eyre!("couldn't find ethers or ethers-contract dependency"))?;
 
         if let Some(rev) = ethers.get("rev") {
-            Ok(format!("ethers = {{ git = \"https://github.com/gakonst/ethers-rs\", rev = {}, default-features = false, features = [\"abigen\"] }}", rev))
+            Ok(format!("ethers = {{ git = \"https://github.com/gakonst/ethers-rs\", rev = {rev}, default-features = false, features = [\"abigen\"] }}"))
         } else if let Some(version) = ethers.get("version") {
             Ok(format!(
-                "ethers = {{ version = {}, default-features = false, features = [\"abigen\"] }}",
-                version
+                "ethers = {{ version = {version}, default-features = false, features = [\"abigen\"] }}"
             ))
         } else {
-            Ok(default_dep())
+            Ok(DEFAULT_ETHERS_DEP.to_string())
         }
     }
 
@@ -608,7 +656,7 @@ impl MultiBindingsInner {
         name: impl AsRef<str>,
         version: impl AsRef<str>,
     ) -> Result<()> {
-        let crate_version = self.find_crate_version()?;
+        let crate_version = self.crate_version();
         let contents = self.generate_cargo_toml(name, version, crate_version)?;
 
         let mut file = fs::OpenOptions::new()
@@ -746,7 +794,7 @@ impl MultiBindingsInner {
 
         if check_cargo_toml {
             // additionally check the contents of the cargo
-            let crate_version = self.find_crate_version()?;
+            let crate_version = self.crate_version();
             let cargo_contents = self.generate_cargo_toml(name, version, crate_version)?;
             check_file_in_dir(crate_path, "Cargo.toml", &cargo_contents)?;
         }
@@ -867,6 +915,18 @@ mod tests {
                 .unwrap()
                 .ensure_consistent_module(mod_root, single_file)
                 .expect("Inconsistent bindings");
+        })
+    }
+
+    #[test]
+    fn can_find_ethers_dep() {
+        run_test(|context| {
+            let Context { multi_gen, mod_root } = context;
+
+            let single_file = true;
+            let mut inner = multi_gen.clone().build().unwrap().into_inner(single_file);
+            inner.root = Some(PathBuf::from("this does not exist"));
+            inner.write_to_module(mod_root, single_file).unwrap();
         })
     }
 
@@ -1283,7 +1343,7 @@ contract Enum {
         name = "ethers-contract"
         version = "1.0.0"
         edition = "2018"
-        rust-version = "1.62"
+        rust-version = "1.64"
         authors = ["Georgios Konstantopoulos <me@gakonst.com>"]
         license = "MIT OR Apache-2.0"
         description = "Smart contract bindings for the ethers-rs crate"
@@ -1329,7 +1389,7 @@ contract Enum {
         name = "ethers-contract"
         version = "1.0.0"
         edition = "2018"
-        rust-version = "1.62"
+        rust-version = "1.64"
         authors = ["Georgios Konstantopoulos <me@gakonst.com>"]
         license = "MIT OR Apache-2.0"
         description = "Smart contract bindings for the ethers-rs crate"
@@ -1376,7 +1436,7 @@ contract Enum {
         name = "ethers-contract"
         version = "1.0.0"
         edition = "2018"
-        rust-version = "1.62"
+        rust-version = "1.64"
         authors = ["Georgios Konstantopoulos <me@gakonst.com>"]
         license = "MIT OR Apache-2.0"
         description = "Smart contract bindings for the ethers-rs crate"
@@ -1423,7 +1483,7 @@ contract Enum {
         name = "ethers-contract"
         version = "1.0.0"
         edition = "2018"
-        rust-version = "1.62"
+        rust-version = "1.64"
         authors = ["Georgios Konstantopoulos <me@gakonst.com>"]
         license = "MIT OR Apache-2.0"
         description = "Smart contract bindings for the ethers-rs crate"
