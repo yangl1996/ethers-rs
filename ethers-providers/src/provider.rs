@@ -24,7 +24,7 @@ use ethers_core::{
         Address, Block, BlockId, BlockNumber, BlockTrace, Bytes, EIP1186ProofResponse, FeeHistory,
         Filter, FilterBlockOption, GethDebugTracingOptions, GethTrace, Log, NameOrAddress,
         Selector, Signature, Trace, TraceFilter, TraceType, Transaction, TransactionReceipt,
-        TransactionRequest, TxHash, TxpoolContent, TxpoolInspect, TxpoolStatus, H256, U256, U64,
+        TransactionRequest, TxHash, TxpoolContent, TxpoolInspect, TxpoolStatus, H256, U256, U64, GethTransactionPrestateTrace
     },
     utils,
 };
@@ -999,6 +999,24 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
         let tx_hash = utils::serialize(&tx_hash);
         let trace_options = utils::serialize(&trace_options);
         self.request("debug_traceTransaction", [tx_hash, trace_options]).await
+    }
+
+    async fn debug_trace_block<T: Into<BlockId> + Send + Sync>(
+        &self,
+        block_hash_or_number: T,
+        trace_options: GethDebugTracingOptions,
+    ) -> Result<Vec<GethTransactionPrestateTrace>, ProviderError> {
+        let trace_options = utils::serialize(&trace_options);
+        Ok(match block_hash_or_number.into() {
+            BlockId::Hash(hash) => {
+                let hash = utils::serialize(&hash);
+                self.request("debug_traceBlockByHash", [hash, trace_options]).await?
+            }
+            BlockId::Number(num) => {
+                let num = utils::serialize(&num);
+                self.request("debug_traceBlockByNumber", [num, trace_options]).await?
+            }
+        })
     }
 
     /// Executes the given call and returns a number of possible traces for it

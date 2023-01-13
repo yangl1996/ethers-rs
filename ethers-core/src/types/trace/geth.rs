@@ -1,6 +1,19 @@
-use crate::types::{Bytes, H256, U256};
+use crate::types::{Bytes, H256, U256, H160};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GethAccountPrestate {
+    pub balance: U256,
+    pub nonce: U256,
+    pub code: Bytes,
+    pub storage: BTreeMap<H256, H256>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GethTransactionPrestateTrace {
+    pub result: BTreeMap<H160, GethAccountPrestate>,
+}
 
 // https://github.com/ethereum/go-ethereum/blob/a9ef135e2dd53682d106c6a2aede9187026cc1de/eth/tracers/logger/logger.go#L406-L411
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

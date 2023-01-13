@@ -513,6 +513,14 @@ pub trait Middleware: Sync + Send + Debug {
         self.inner().debug_trace_transaction(tx_hash, trace_options).await.map_err(FromErr::from)
     }
 
+    async fn debug_trace_block<T: Into<BlockId> + Send + Sync>(
+        &self,
+        block_hash_or_number: T,
+        trace_options: GethDebugTracingOptions,
+    ) -> Result<Vec<GethTransactionPrestateTrace>, Self::Error> {
+        self.inner().debug_trace_block(block_hash_or_number, trace_options).await.map_err(FromErr::from)
+    }
+
     // Parity `trace` support
 
     /// Executes the given call and returns a number of possible traces for it
